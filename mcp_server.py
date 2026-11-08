@@ -22,35 +22,14 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from cws_common import resolve_out
+
 PORT = int(os.environ.get("CLAUDE_SYNC_PORT", "47821"))
 EXT_ID = os.environ.get("CLAUDE_SYNC_EXT_ID", "")
 POLL_HOLD = 20  # 秒:擴充功能的 long-poll 最多等多久
 
 
-def _downloads_dir() -> Path:
-    """真正的下載資料夾(Windows 使用者常把它搬到別的磁碟,不能寫死 ~/Downloads)。"""
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            import uuid as _uuid
-
-            # FOLDERID_Downloads
-            guid = (ctypes.c_byte * 16).from_buffer_copy(
-                _uuid.UUID("374DE290-123F-4565-9164-39C4925E467B").bytes_le)
-            buf = ctypes.c_wchar_p()
-            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(buf)) == 0:
-                return Path(buf.value)
-        except Exception:  # noqa: BLE001
-            pass
-    return Path.home() / "Downloads"
-
-
-def _default_out() -> Path:
-    ext = _downloads_dir() / "claude-web-sync"
-    return ext if ext.is_dir() else Path.home() / "claude-web-sync-data"
-
-
-OUT = Path(os.environ.get("CLAUDE_SYNC_OUT") or _default_out())
+OUT = resolve_out()
 
 
 # ───────────────────────── 橋接:MCP ⇄ 擴充功能 ─────────────────────────
@@ -63,6 +42,15 @@ class Bridge:
         self.results = {}
         self.last_seen = 0.0
         self.server = None
+        self.accepted = 0        # 通過檢查的請求數
+        self.rejects = []        # 最近被拒絕的請求與原因(診斷用)
+
+    def note_reject(self, msg: str) -> None:
+        self.rejects = (self.rejects + [f"{time.strftime('%H:%M:%S')} {msg}"])[-5:]
+
+    def diag(self) -> str:
+        s = f"通過 {self.accepted} 次"
+        return s + (";最近被拒:" + " | ".join(self.rejects) if self.rejects else ";沒有被拒絕的請求")
 
     # --- HTTP 端 ---
     def start(self) -> bool:
@@ -72,13 +60,23 @@ class Bridge:
             def log_message(self, *a):  # 不能往 stdout 寫(那是 MCP 的通道)
                 pass
 
-            def _origin_ok(self) -> bool:
+            def _check(self):
+                """回傳拒絕原因;None 表示通過。
+                Host 必須是本機(擋 DNS rebinding);Origin 若有帶,必須是 chrome-extension://(可釘 ID)。
+                Origin 沒帶也放行——Chrome 對某些擴充功能 GET 請求不一定附 Origin;網頁無法冒用,
+                因為帶自訂標頭 X-CWS 會觸發預檢,而預檢(OPTIONS)只對 chrome-extension:// 來源回應。"""
+                host = self.headers.get("Host", "")
+                if host not in (f"127.0.0.1:{bridge.port}", f"localhost:{bridge.port}"):
+                    return f"Host 不符:{host[:40]!r}"
                 o = self.headers.get("Origin", "")
-                if not o.startswith("chrome-extension://"):
-                    return False
-                if bridge.ext_id and o != f"chrome-extension://{bridge.ext_id}":
-                    return False
-                return self.headers.get("Host", "") in (f"127.0.0.1:{bridge.port}", f"localhost:{bridge.port}")
+                if o:
+                    if not o.startswith("chrome-extension://"):
+                        return f"Origin 不是擴充功能:{o[:60]}"
+                    if bridge.ext_id and o != f"chrome-extension://{bridge.ext_id}":
+                        return f"Origin 與釘住的 ID 不符:{o[:60]}"
+                elif bridge.ext_id:
+                    return "沒帶 Origin(已釘住擴充功能 ID,必須帶)"
+                return None
 
             def _send(self, code, obj=None):
                 body = b"" if obj is None else json.dumps(obj).encode()
@@ -93,13 +91,25 @@ class Bridge:
                 self.wfile.write(body)
 
             def _guard(self) -> bool:
-                if not (self._origin_ok() and self.headers.get("X-CWS") == "1"):
+                why = self._check()
+                if why is None and self.headers.get("X-CWS") != "1":
+                    why = "缺少 X-CWS 標頭"
+                if why:
+                    bridge.note_reject(f"{self.command} {self.path}:{why}")
                     self._send(403, {"error": "forbidden"})
                     return False
+                bridge.accepted += 1
                 return True
 
             def do_OPTIONS(self):
-                self._send(204) if self._origin_ok() else self._send(403, {"error": "forbidden"})
+                # 預檢:只對 chrome-extension:// 來源開放(這是擋一般網頁的關鍵)
+                why = self._check()
+                if why is None and not self.headers.get("Origin", "").startswith("chrome-extension://"):
+                    why = "預檢沒帶擴充功能 Origin"
+                if why:
+                    bridge.note_reject(f"OPTIONS {self.path}:{why}")
+                    return self._send(403, {"error": "forbidden"})
+                self._send(204)
 
             def do_GET(self):
                 if self.path != "/poll" or not self._guard():
@@ -207,7 +217,7 @@ def get_status() -> str:
         link = f"擴充功能 {int(time.time() - bridge.last_seen)} 秒前連線過"
     else:
         link = "擴充功能尚未連線"
-    return (f"輸出資料夾:{OUT}\n最後同步:{last}\n橋接:{link}(埠 {PORT})\n"
+    return (f"輸出資料夾:{OUT}\n最後同步:{last}\n橋接:{link}(埠 {PORT};{bridge.diag()})\n"
             f"memory.md:{'有' if _read('memory.md') else '無'}\n"
             f"preferences.md:{'有' if _read('preferences.md') else '無'}\n"
             f"Projects:{projects}")
