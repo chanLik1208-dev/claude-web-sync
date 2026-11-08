@@ -191,7 +191,8 @@ async function collect(api, cfg) {
 // ───────── 寫檔(Downloads/<folder>/…,只在內容變動時寫;舊版進 history/) ─────────
 async function save(filename, text) {
   const id = await chrome.downloads.download({
-    url: `data:text/plain;charset=utf-8;base64,${b64(text)}`, filename, conflictAction: 'overwrite', saveAs: false,
+    // 不能用 text/plain:Chrome 會依 MIME 把 .md/.json 改成 .txt。octet-stream 不會動副檔名
+    url: `data:application/octet-stream;base64,${b64(text)}`, filename, conflictAction: 'overwrite', saveAs: false,
   });
   for (let i = 0; i < 100; i++) {
     const [d] = await chrome.downloads.search({ id });
