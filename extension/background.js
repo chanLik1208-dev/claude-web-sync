@@ -112,17 +112,18 @@ function makeApi() {
 }
 
 // ───────── 記憶本文(melange):讀取端點未公開,依序試;成功的會記住 ─────────
+// 已由網頁實際請求確認:POST /melange/read,body 是 {"path": "/topics/xxx.md"}(不是 memory_id)
 const MEL_READS = [
-  (o, it) => ['POST', `/api/organizations/${o}/melange/read`, { memory_id: it.memory_id }],
-  (o, it) => ['POST', `/api/organizations/${o}/melange/get`, { memory_id: it.memory_id }],
-  (o, it) => ['GET', `/api/organizations/${o}/melange/${it.memory_id}`],
-  (o, it) => ['GET', `/api/organizations/${o}/melange/memories/${it.memory_id}`],
+  (o, it) => ['POST', `/api/organizations/${o}/melange/read`, { path: it.path }],
 ];
 function pickBody(r) {
   if (r.s !== 200) return null;
   if (r.j) {
-    const t = findStrings(r.j, /^(content|text|body|markdown|memory)$/).map(([, v]) => v).join('\n').trim();
-    return t || null;
+    const known = findStrings(r.j, /^(content|text|body|markdown|memory)$/).map(([, v]) => v).join('\n').trim();
+    if (known) return known;
+    // 回應欄位名稱未確認:退而取 JSON 裡最長的字串
+    const all = findStrings(r.j, /./).map(([, v]) => v).sort((a, b) => b.length - a.length);
+    return all[0]?.trim() || null;
   }
   const t = (r.t || '').trim();
   return t && !t.startsWith('<') ? t : null; // 擋掉 200 但其實是 HTML 的情況
