@@ -2,7 +2,7 @@
 // 在「你自己已登入的 Chrome」裡定時讀 claude.ai 的內部端點,存成檔案到 Downloads/<folder>/。
 // 端點為未公開介面,可能隨時改版;每個項目獨立容錯。
 const BASE = 'https://claude.ai';
-const DEFAULTS = { minutes: 60, folder: 'claude-web-sync', knowledge: true };
+const DEFAULTS = { minutes: 60, folder: 'claude-web-sync', knowledge: true, port: 47821 };
 const MEMORY_CANDIDATES = [
   (o) => `/api/organizations/${o}/memory`,
   (o) => `/api/organizations/${o}/memory/synthesis`,
@@ -289,13 +289,42 @@ async function runSync({ force = false } = {}) {
   return status;
 }
 
+// ───────── 橋接:問本機 MCP server 有沒有人要同步(long-poll,每 30 秒一輪) ─────────
+let polling = false;
+async function pollBridge() {
+  if (polling) return;
+  polling = true;
+  try {
+    const { port } = await getCfg();
+    const base = `http://127.0.0.1:${Number(port) || DEFAULTS.port}`;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 27000);
+    let req;
+    try {
+      const r = await fetch(`${base}/poll`, { headers: { 'X-CWS': '1' }, signal: ctl.signal });
+      if (!r.ok) return;
+      req = await r.json();
+    } finally { clearTimeout(timer); }
+    if (!req?.id) return;
+    const status = await runSync({ force: !!req.force });
+    await fetch(`${base}/result`, {
+      method: 'POST', headers: { 'X-CWS': '1', 'content-type': 'application/json' },
+      body: JSON.stringify({ id: req.id, status }),
+    });
+  } catch { /* MCP server 沒開:靜默 */ } finally { polling = false; }
+}
+
 async function schedule() {
   const { minutes } = await getCfg();
   await chrome.alarms.create('sync', { delayInMinutes: 1, periodInMinutes: Math.max(5, Number(minutes) || 60) });
+  await chrome.alarms.create('poll', { delayInMinutes: 0.1, periodInMinutes: 0.5 });
 }
 chrome.runtime.onInstalled.addListener(schedule);
 chrome.runtime.onStartup.addListener(schedule);
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'sync') runSync(); });
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === 'sync') runSync();
+  else if (a.name === 'poll') pollBridge();
+});
 chrome.runtime.onMessage.addListener((msg, _s, reply) => {
   if (msg?.type === 'sync') { runSync({ force: !!msg.force }).then(reply); return true; }
   if (msg?.type === 'reschedule') { schedule().then(() => reply(true)); return true; }

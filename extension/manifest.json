@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Periodically save your claude.ai custom instructions, memory, Projects and Styles to local files.",
   "permissions": ["alarms", "storage", "unlimitedStorage", "downloads", "scripting", "webRequest"],
-  "host_permissions": ["https://claude.ai/*"],
+  "host_permissions": ["https://claude.ai/*", "http://127.0.0.1/*"],
   "background": { "service_worker": "background.js" },
   "action": { "default_title": "Claude Web Sync", "default_popup": "popup.html" }
 }

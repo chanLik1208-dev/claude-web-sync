@@ -28,7 +28,10 @@ python claude_web_sync.py login | sync | discover | schedule --every 60 | unsche
 ```
 claude mcp add claude-web-sync -s user -- python /path/to/mcp_server.py
 ```
-Reads `Downloads/claude-web-sync` (or `$CLAUDE_SYNC_OUT`). Tools: `sync_now` (CLI only), `get_status`, `read_memory`, `read_preferences`, `list_projects`, `read_project`, `search_synced`.
+Reads `<Downloads>/claude-web-sync` (or `$CLAUDE_SYNC_OUT`). Tools: `sync_now`, `get_status`, `read_memory`, `read_preferences`, `list_projects`, `read_project`, `search_synced`.
+
+**`sync_now` asks your own Chrome to sync.** The MCP server opens a tiny HTTP port on `127.0.0.1:47821` (`CLAUDE_SYNC_PORT`); the extension long-polls it every 30 s, runs the sync in your logged-in browser when asked, and posts the result back. Chrome must be open with the extension loaded; set the same port in the extension popup if you change it.
+Only requests with `Origin: chrome-extension://…`, an `X-CWS` header and a localhost `Host` are accepted (pin your extension ID with `CLAUDE_SYNC_EXT_ID`). If another Claude session already owns the port, `sync_now` says so and the read tools still work on the local copy.
 
 ## Security
 The extension holds no credentials: it reuses the browser's own session. The CLI's profile (`~/.claude-web-sync/profile`) contains a session cookie — never commit or cloud-sync it.
