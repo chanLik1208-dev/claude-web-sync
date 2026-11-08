@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const DEFAULTS = { minutes: 60, folder: 'claude-web-sync', knowledge: true };
+const DEFAULTS = { minutes: 60, folder: 'claude-web-sync', knowledge: true, port: 47821 };
 
 function render(s) {
   if (!s) { $('status').textContent = '尚未同步過'; return; }
