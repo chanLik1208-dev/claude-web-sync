@@ -27,7 +27,8 @@ async function run(force) {
 }
 
 (async () => {
-  const { cfg, status } = await chrome.storage.local.get(['cfg', 'status']);
+  const { cfg, status, melLog } = await chrome.storage.local.get(['cfg', 'status', 'melLog']);
+  if (melLog?.length) $('mel').textContent = melLog.slice(-12).map((x) => `${x.method} ${x.url}${x.body ? '\n  body: ' + x.body : ''}`).join('\n');
   const c = { ...DEFAULTS, ...(cfg || {}) };
   $('minutes').value = c.minutes; $('folder').value = c.folder; $('knowledge').checked = c.knowledge;
   render(status);

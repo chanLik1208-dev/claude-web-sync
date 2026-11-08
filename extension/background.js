@@ -59,7 +59,7 @@ function makeApi() {
     const t = await r.text();
     let j = null;
     try { j = JSON.parse(t); } catch { /* 非 JSON */ }
-    return { s: r.status, j };
+    return { s: r.status, j, t };
   }
 
   async function ensureTab() {
@@ -86,8 +86,8 @@ function makeApi() {
         try {
           const r = await fetch(p, init); const t = await r.text(); let j = null;
           try { j = JSON.parse(t); } catch { /* 非 JSON */ }
-          return { s: r.status, j };
-        } catch { return { s: 0, j: null }; }
+          return { s: r.status, j, t };
+        } catch { return { s: 0, j: null, t: '' }; }
       },
     });
     return result;
@@ -110,6 +110,46 @@ function makeApi() {
     cleanup: async () => { if (st.created && st.tabId != null) { try { await chrome.tabs.remove(st.tabId); } catch { /* 已關 */ } } },
   };
 }
+
+// ───────── 記憶本文(melange):讀取端點未公開,依序試;成功的會記住 ─────────
+const MEL_READS = [
+  (o, it) => ['POST', `/api/organizations/${o}/melange/read`, { memory_id: it.memory_id }],
+  (o, it) => ['POST', `/api/organizations/${o}/melange/get`, { memory_id: it.memory_id }],
+  (o, it) => ['GET', `/api/organizations/${o}/melange/${it.memory_id}`],
+  (o, it) => ['GET', `/api/organizations/${o}/melange/memories/${it.memory_id}`],
+];
+function pickBody(r) {
+  if (r.s !== 200) return null;
+  if (r.j) {
+    const t = findStrings(r.j, /^(content|text|body|markdown|memory)$/).map(([, v]) => v).join('\n').trim();
+    return t || null;
+  }
+  const t = (r.t || '').trim();
+  return t && !t.startsWith('<') ? t : null; // 擋掉 200 但其實是 HTML 的情況
+}
+async function readMelange(api, oid, it) {
+  const saved = (await chrome.storage.local.get('melRead')).melRead;
+  const order = saved != null ? [saved] : MEL_READS.map((_, i) => i);
+  for (const i of order) {
+    const [method, path, body] = MEL_READS[i](oid, it);
+    const r = method === 'GET' ? await api.get(path) : await api.post(path, body);
+    const text = pickBody(r);
+    if (text !== null) { await chrome.storage.local.set({ melRead: i }); return text; }
+  }
+  if (saved != null) await chrome.storage.local.remove('melRead'); // 記住的失效了,下次重新試
+  return null;
+}
+
+// 唯讀偵測:記下「你在網頁上」對 melange 發出的請求(只存 method/url/前 300 字 body,最多 30 筆)
+chrome.webRequest.onBeforeRequest.addListener((d) => {
+  if (d.tabId < 0) return; // 排除擴充功能自己的請求
+  let body = '';
+  try { body = d.requestBody?.raw?.[0]?.bytes ? new TextDecoder().decode(d.requestBody.raw[0].bytes).slice(0, 300) : ''; } catch { /* 忽略 */ }
+  chrome.storage.local.get('melLog').then(({ melLog = [] }) => {
+    melLog.push({ t: Date.now(), method: d.method, url: d.url.replace(BASE, ''), body });
+    chrome.storage.local.set({ melLog: melLog.slice(-30) });
+  });
+}, { urls: ['https://claude.ai/api/*melange*'] }, ['requestBody']);
 
 // ───────── 收集 ─────────
 async function collect(api, cfg) {
@@ -152,9 +192,16 @@ async function collect(api, cfg) {
   const mel = await api.post(`/api/organizations/${oid}/melange/list`, {});
   if (mel.s === 200 && mel.j) {
     put('raw/memory_melange.json', json(mel.j), false);
-    for (const it of asList(mel.j, 'data')) {
-      const txt = findStrings(it, /^(content|text|memory|summary|title)$/).map(([, v]) => v).join('\n');
-      sections.push('- ' + (txt || JSON.stringify(it)).replace(/\n/g, '\n  '));
+    const items = asList(mel.j, 'data');
+    let readFail = 0;
+    for (const it of items) {
+      const title = (it.display_path_segments || []).join(' / ') || it.display_name || it.path || it.memory_id;
+      const body = await readMelange(api, oid, it);
+      if (body === null) readFail++;
+      sections.push(`## ${title}\n(${it.path || ''},更新:${it.updated_at || '?'})\n\n${it.description || ''}${body ? `\n\n${body}` : ''}`);
+    }
+    if (items.length && readFail === items.length) {
+      problems.push('memory: 目錄抓到了但讀不到本文(端點未知)。請在網頁點開一筆記憶,再看 popup 的「偵測到的記憶請求」');
     }
   }
   put('memory.md', sections.join('\n\n') || `(目前沒有記憶內容;記憶模式:${ms.j?.memory_mode ?? '未知'})`);
