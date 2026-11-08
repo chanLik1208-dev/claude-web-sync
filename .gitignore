@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+profile/
+.claude-web-sync/
+claude-web-sync-data/
+*.log
+.env
