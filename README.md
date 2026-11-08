@@ -33,6 +33,15 @@ Reads `<Downloads>/claude-web-sync` (or `$CLAUDE_SYNC_OUT`). Tools: `sync_now`, 
 **`sync_now` asks your own Chrome to sync.** The MCP server opens a tiny HTTP port on `127.0.0.1:47821` (`CLAUDE_SYNC_PORT`); the extension long-polls it every 30 s, runs the sync in your logged-in browser when asked, and posts the result back. Chrome must be open with the extension loaded; set the same port in the extension popup if you change it.
 Requests need a localhost `Host`, an `X-CWS` header, and — if an `Origin` is present — it must be `chrome-extension://…` (pin your extension ID with `CLAUDE_SYNC_EXT_ID`, which then also makes `Origin` mandatory). Web pages cannot forge this: the custom header forces a CORS preflight, and preflights are only answered for `chrome-extension://` origins. `get_status` shows how many requests were accepted and why recent ones were rejected. If another Claude session already owns the port, `sync_now` says so and the read tools still work on the local copy.
 
+## Setting up another computer
+Everything lives per machine (settings, the MCP registration and the synced copy), so repeat on each computer:
+```
+git clone https://github.com/chanLik1208-dev/claude-web-sync && cd claude-web-sync
+pip install -r requirements.txt     # only needed for the MCP server (mcp package)
+python install.py                   # merges the SessionStart hook into ~/.claude/settings.json + registers the MCP server
+```
+Then load `extension/` in Chrome (signed in to claude.ai) and click **立即同步** once, and start a new Claude Code session. `python install.py --uninstall` reverses it. The installer keeps your other settings, backs up the file to `settings.json.bak`, is safe to re-run, and aborts without touching a settings file that isn't valid JSON.
+
 ## Auto-load at session start (SessionStart hook)
 `session_hook.py` prints your synced claude.ai custom instructions + memory as `additionalContext`, so every new Claude Code session starts with them. Add to `~/.claude/settings.json`:
 ```json
