@@ -1,0 +1,254 @@
+// Claude Web Sync — MV3 service worker.
+// 在「你自己已登入的 Chrome」裡定時讀 claude.ai 的內部端點,存成檔案到 Downloads/<folder>/。
+// 端點為未公開介面,可能隨時改版;每個項目獨立容錯。
+const BASE = 'https://claude.ai';
+const DEFAULTS = { minutes: 60, folder: 'claude-web-sync', knowledge: true };
+const MEMORY_CANDIDATES = [
+  (o) => `/api/organizations/${o}/memory`,
+  (o) => `/api/organizations/${o}/memory/synthesis`,
+];
+const STYLE_CANDIDATES = [
+  (o) => `/api/organizations/${o}/list_styles`,
+  (o) => `/api/organizations/${o}/styles`,
+];
+
+// ───────── 小工具 ─────────
+const sortKeys = (o) =>
+  Array.isArray(o) ? o.map(sortKeys)
+    : o && typeof o === 'object' ? Object.fromEntries(Object.keys(o).sort().map((k) => [k, sortKeys(o[k])]))
+      : o;
+const json = (o) => JSON.stringify(sortKeys(o), null, 2);
+const slug = (s, f = 'untitled') => {
+  const x = String(s ?? '').replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim().replace(/^[. ]+|[. ]+$/g, '').slice(0, 80);
+  return x || f;
+};
+const asList = (d, ...keys) =>
+  Array.isArray(d) ? d : d && typeof d === 'object' ? keys.map((k) => d[k]).find(Array.isArray) || [] : [];
+function findStrings(obj, re, path = '') {
+  const out = [];
+  if (Array.isArray(obj)) obj.forEach((v, i) => out.push(...findStrings(v, re, `${path}[${i}]`)));
+  else if (obj && typeof obj === 'object') {
+    for (const [k, v] of Object.entries(obj)) {
+      const p = path ? `${path}.${k}` : k;
+      if (typeof v === 'string' && v.trim() && re.test(k)) out.push([p, v]);
+      else out.push(...findStrings(v, re, p));
+    }
+  }
+  return out;
+}
+function b64(text) {
+  const bytes = new TextEncoder().encode(text);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+const getCfg = async () => ({ ...DEFAULTS, ...((await chrome.storage.local.get('cfg')).cfg || {}) });
+
+// ───────── API:先用 service worker fetch;被拒就改走 claude.ai 分頁 ─────────
+function makeApi() {
+  const st = { useTab: false, tabId: null, created: false };
+
+  async function viaFetch(path, body) {
+    const init = { credentials: 'include', headers: { accept: 'application/json' } };
+    if (body !== undefined) {
+      init.method = 'POST';
+      init.headers['content-type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
+    const r = await fetch(BASE + path, init);
+    const t = await r.text();
+    let j = null;
+    try { j = JSON.parse(t); } catch { /* 非 JSON */ }
+    return { s: r.status, j };
+  }
+
+  async function ensureTab() {
+    if (st.tabId != null) return st.tabId;
+    const [existing] = await chrome.tabs.query({ url: `${BASE}/*` });
+    if (existing) { st.tabId = existing.id; return st.tabId; }
+    const tab = await chrome.tabs.create({ url: `${BASE}/settings/profile`, active: false });
+    st.tabId = tab.id; st.created = true;
+    await new Promise((res) => {
+      const done = (id, info) => { if (id === tab.id && info.status === 'complete') { chrome.tabs.onUpdated.removeListener(done); res(); } };
+      chrome.tabs.onUpdated.addListener(done);
+      setTimeout(res, 30000);
+    });
+    return st.tabId;
+  }
+
+  async function viaTab(path, body) {
+    const tabId = await ensureTab();
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [path, body === undefined ? null : body],
+      func: async (p, b) => {
+        const init = { credentials: 'include', headers: { accept: 'application/json' } };
+        if (b !== null) { init.method = 'POST'; init.headers['content-type'] = 'application/json'; init.body = JSON.stringify(b); }
+        try {
+          const r = await fetch(p, init); const t = await r.text(); let j = null;
+          try { j = JSON.parse(t); } catch { /* 非 JSON */ }
+          return { s: r.status, j };
+        } catch { return { s: 0, j: null }; }
+      },
+    });
+    return result;
+  }
+
+  const call = async (path, body) => {
+    if (!st.useTab) {
+      try {
+        const r = await viaFetch(path, body);
+        if (![0, 401, 403].includes(r.s)) return r;
+      } catch { /* 改走分頁 */ }
+      st.useTab = true;
+    }
+    return viaTab(path, body);
+  };
+  return {
+    get: (p) => call(p),
+    post: (p, b) => call(p, b),
+    mode: () => (st.useTab ? 'tab' : 'fetch'),
+    cleanup: async () => { if (st.created && st.tabId != null) { try { await chrome.tabs.remove(st.tabId); } catch { /* 已關 */ } } },
+  };
+}
+
+// ───────── 收集 ─────────
+async function collect(api, cfg) {
+  const out = {}; const problems = [];
+  const put = (path, text, history = true) => { out[path] = { text: text.endsWith('\n') ? text : text + '\n', history }; };
+
+  const orgs = await api.get('/api/organizations');
+  if (orgs.s !== 200 || !Array.isArray(orgs.j)) throw new Error(`未登入或被擋 (HTTP ${orgs.s})。請先在這個 Chrome 登入 claude.ai`);
+  put('raw/organizations.json', json(orgs.j), false);
+  const org = orgs.j.find((o) => (o.capabilities || []).includes('chat')) || orgs.j[0];
+  const oid = org.uuid;
+
+  const acc = await api.get('/api/account');
+  let email = null;
+  if (acc.s === 200 && acc.j) { email = acc.j.email_address; put('raw/account.json', json(acc.j), false); }
+  else problems.push(`account: HTTP ${acc.s}`);
+
+  const prof = await api.get('/api/account_profile');
+  if (prof.s === 200 && prof.j) {
+    put('raw/account_profile.json', json(prof.j), false);
+    const body = ['conversation_preferences', 'cowork_global_instructions']
+      .filter((k) => typeof prof.j[k] === 'string' && prof.j[k].trim())
+      .map((k) => `## ${k}\n\n${prof.j[k]}`).join('\n\n');
+    put('preferences.md', body || '(沒有自訂指令)');
+  } else problems.push(`account_profile: HTTP ${prof.s}`);
+
+  const ms = await api.get(`/api/organizations/${oid}/memory/settings`);
+  if (ms.s === 200) put('raw/memory_settings.json', json(ms.j), false);
+  const sections = [];
+  let memOk = false;
+  for (const f of MEMORY_CANDIDATES) {
+    const m = await api.get(f(oid));
+    if (m.s === 200) {
+      put('raw/memory.json', json(m.j), false); memOk = true;
+      if (m.j && typeof m.j.memory === 'string' && m.j.memory.trim()) sections.push(`## memory\n\n${m.j.memory.trim()}`);
+      break;
+    }
+  }
+  if (!memOk) problems.push('memory: 候選端點都失敗');
+  const mel = await api.post(`/api/organizations/${oid}/melange/list`, {});
+  if (mel.s === 200 && mel.j) {
+    put('raw/memory_melange.json', json(mel.j), false);
+    for (const it of asList(mel.j, 'data')) {
+      const txt = findStrings(it, /^(content|text|memory|summary|title)$/).map(([, v]) => v).join('\n');
+      sections.push('- ' + (txt || JSON.stringify(it)).replace(/\n/g, '\n  '));
+    }
+  }
+  put('memory.md', sections.join('\n\n') || `(目前沒有記憶內容;記憶模式:${ms.j?.memory_mode ?? '未知'})`);
+
+  for (const f of STYLE_CANDIDATES) {
+    const s = await api.get(f(oid));
+    if (s.s === 200) {
+      put('raw/styles.json', json(s.j), false);
+      for (const st of asList(s.j, 'styles', 'custom_styles', 'data')) {
+        if (st && (st.type ?? 'custom') === 'custom') put(`styles/${slug(st.name)}.md`, st.prompt || JSON.stringify(st, null, 2));
+      }
+      break;
+    }
+  }
+
+  let pr = await api.get(`/api/organizations/${oid}/projects?limit=200`);
+  if (pr.s !== 200) pr = await api.get(`/api/organizations/${oid}/projects`);
+  if (pr.s === 200) {
+    put('raw/projects.json', json(pr.j), false);
+    for (const p of asList(pr.j, 'projects', 'data')) {
+      const base = `projects/${slug(p.name)}-${String(p.uuid).slice(0, 8)}`;
+      put(`${base}/instructions.md`, (p.prompt_template || '').trim() || '(無自訂指令)');
+      put(`${base}/README.md`, `# ${p.name}\n\n${p.description || ''}`.trimEnd());
+      if (!cfg.knowledge) continue;
+      const d = await api.get(`/api/organizations/${oid}/projects/${p.uuid}/docs`);
+      if (d.s === 200) for (const doc of asList(d.j, 'docs', 'data')) put(`${base}/knowledge/${slug(doc.file_name || doc.uuid)}`, doc.content || '');
+      else problems.push(`project ${p.name} docs: HTTP ${d.s}`);
+    }
+  } else problems.push(`projects: HTTP ${pr.s}`);
+
+  return { out, problems, email, org: org.name };
+}
+
+// ───────── 寫檔(Downloads/<folder>/…,只在內容變動時寫;舊版進 history/) ─────────
+async function save(filename, text) {
+  const id = await chrome.downloads.download({
+    url: `data:text/plain;charset=utf-8;base64,${b64(text)}`, filename, conflictAction: 'overwrite', saveAs: false,
+  });
+  for (let i = 0; i < 100; i++) {
+    const [d] = await chrome.downloads.search({ id });
+    if (d?.state === 'complete') return;
+    if (d?.state === 'interrupted') throw new Error(`下載中斷:${filename} (${d.error})`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(`下載逾時:${filename}`);
+}
+
+async function writeAll(out, cfg, force) {
+  const snap = (await chrome.storage.local.get('snap')).snap || {};
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const changed = [];
+  for (const [path, { text, history }] of Object.entries(out)) {
+    const old = snap[path];
+    if (!force && old === text) continue;
+    if (old !== undefined && old !== text && history) await save(`${cfg.folder}/history/${path}.${stamp}`, old);
+    await save(`${cfg.folder}/${path}`, text);
+    snap[path] = text; changed.push(path);
+  }
+  await chrome.storage.local.set({ snap });
+  await save(`${cfg.folder}/last_sync.txt`, new Date().toISOString());
+  return changed;
+}
+
+// ───────── 主流程 ─────────
+let running = false;
+async function runSync({ force = false } = {}) {
+  if (running) return { ok: false, msg: '同步進行中' };
+  running = true;
+  const api = makeApi();
+  let status;
+  try {
+    const cfg = await getCfg();
+    const { out, problems, email, org } = await collect(api, cfg);
+    const changed = await writeAll(out, cfg, force);
+    status = { ok: true, time: Date.now(), email, org, mode: api.mode(), changed, problems, msg: `完成:${changed.length} 個檔案有變更` };
+  } catch (e) {
+    status = { ok: false, time: Date.now(), msg: String(e.message || e) };
+  } finally {
+    await api.cleanup();
+    running = false;
+  }
+  await chrome.storage.local.set({ status });
+  return status;
+}
+
+async function schedule() {
+  const { minutes } = await getCfg();
+  await chrome.alarms.create('sync', { delayInMinutes: 1, periodInMinutes: Math.max(5, Number(minutes) || 60) });
+}
+chrome.runtime.onInstalled.addListener(schedule);
+chrome.runtime.onStartup.addListener(schedule);
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'sync') runSync(); });
+chrome.runtime.onMessage.addListener((msg, _s, reply) => {
+  if (msg?.type === 'sync') { runSync({ force: !!msg.force }).then(reply); return true; }
+  if (msg?.type === 'reschedule') { schedule().then(() => reply(true)); return true; }
+  return false;
+});

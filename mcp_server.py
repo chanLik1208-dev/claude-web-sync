@@ -12,7 +12,13 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 HERE = Path(__file__).resolve().parent
-OUT = Path(os.environ.get("CLAUDE_SYNC_OUT", Path.home() / "claude-web-sync-data"))
+def _default_out() -> Path:
+    # 擴充功能預設寫到 Downloads/claude-web-sync;舊版 CLI 寫到 ~/claude-web-sync-data
+    ext = Path.home() / "Downloads" / "claude-web-sync"
+    return ext if ext.is_dir() else Path.home() / "claude-web-sync-data"
+
+
+OUT = Path(os.environ.get("CLAUDE_SYNC_OUT") or _default_out())
 CLI = HERE / "claude_web_sync.py"
 
 mcp = FastMCP("claude-web-sync")

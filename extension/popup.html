@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: 320px; margin: 12px; font: 13px/1.5 system-ui, sans-serif; }
+  button { padding: 6px 10px; margin: 2px 4px 2px 0; cursor: pointer; }
+  #status { white-space: pre-wrap; background: #8881; padding: 8px; border-radius: 6px; margin: 8px 0; }
+  label { display: block; margin: 4px 0; }
+  input[type=number] { width: 64px; }
+  .muted { opacity: .65; font-size: 12px; }
+</style>
+</head>
+<body>
+  <strong>Claude Web Sync</strong>
+  <div id="status">載入中…</div>
+  <button id="sync">立即同步</button>
+  <button id="force">強制重寫全部</button>
+  <label>每 <input id="minutes" type="number" min="5" value="60"> 分鐘自動同步</label>
+  <label>資料夾(在 Downloads 底下)<input id="folder" value="claude-web-sync"></label>
+  <label><input id="knowledge" type="checkbox" checked> 一併下載 Project 知識庫檔案</label>
+  <div class="muted">需先在這個 Chrome 登入 claude.ai。若 Chrome 開了「下載前詢問儲存位置」,請關閉。</div>
+  <script src="popup.js"></script>
+</body>
+</html>
