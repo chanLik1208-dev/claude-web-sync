@@ -82,14 +82,17 @@ def launch(pw, headless: bool):
         headless=headless,
         viewport={"width": 1200, "height": 800},
         args=["--disable-blink-features=AutomationControlled"],
+        chromium_sandbox=True,  # Playwright 預設會加 --no-sandbox,Chrome 會跳不安全警告
+        ignore_default_args=["--enable-automation"],  # 去掉「受自動測試軟體控制」橫幅
     )
-    last = None
+    errs = []
     for ch in ("chrome", "msedge", None):  # 優先用系統瀏覽器,免下載 chromium
         try:
             return pw.chromium.launch_persistent_context(**kw, **({"channel": ch} if ch else {}))
         except Exception as e:  # noqa: BLE001
-            last = e
-    sys.exit(f"找不到可用瀏覽器,請安裝 Chrome 或執行 `playwright install chromium`\n{last}")
+            errs.append(f"[{ch or 'chromium'}] {str(e).splitlines()[0]}")
+    sys.exit("無法啟動瀏覽器。若有殘留的登入視窗請先關閉(同一個 profile 不能同時開兩次);"
+             "沒有 Chrome 則執行 `playwright install chromium`\n" + "\n".join(errs))
 
 
 class Api:
