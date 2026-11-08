@@ -81,7 +81,8 @@ def launch(pw, headless: bool):
         user_data_dir=str(PROFILE),
         headless=headless,
         viewport={"width": 1200, "height": 800},
-        args=["--disable-blink-features=AutomationControlled"],
+        # 不要加額外旗標:--no-sandbox、--disable-blink-features=AutomationControlled
+        # 都會讓 Chrome 跳「不受支援的命令列標幟」警告
         chromium_sandbox=True,  # Playwright 預設會加 --no-sandbox,Chrome 會跳不安全警告
         ignore_default_args=["--enable-automation"],  # 去掉「受自動測試軟體控制」橫幅
     )
