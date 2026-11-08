@@ -114,6 +114,22 @@ class Api:
             return r["s"], r["t"]
 
 
+def _post_json(self, path: str, body: dict):
+    r = self.page.evaluate(
+        """async ([u,b]) => { try { const r = await fetch(u, {method:'POST', credentials:'include',
+            headers:{'accept':'application/json','content-type':'application/json'}, body: JSON.stringify(b)});
+            return {s:r.status, t:await r.text()}; } catch(e){ return {s:0, t:String(e)}; } }""",
+        [path, body],
+    )
+    try:
+        return r["s"], json.loads(r["t"])
+    except Exception:  # noqa: BLE001
+        return r["s"], r["t"]
+
+
+Api.post_json = _post_json
+
+
 def open_site(ctx):
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page.goto(BASE + "/settings/profile", wait_until="domcontentloaded", timeout=60000)
@@ -122,11 +138,14 @@ def open_site(ctx):
 
 
 # ───────────────────────── login ─────────────────────────
-def cmd_login(_a):
+def cmd_login(a):
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
         ctx = launch(pw, headless=False)
+        if a.fresh:  # 換帳號:清掉舊 cookie 再登入
+            ctx.clear_cookies()
+            print("已清除舊登入狀態,請登入你要同步的帳號")
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(BASE + "/login")
         print("請在彈出的視窗登入 claude.ai(最多等 10 分鐘)…")
@@ -195,30 +214,46 @@ def cmd_sync(a):
             oid = org["uuid"]
             print(f"組織:{org.get('name')} ({oid})")
 
-            # 帳號 / 個人偏好
+            # 帳號(印出來,避免登錯帳號卻沒發現)
             st, acc = api.get("/api/account")
-            if st == 200:
+            if st == 200 and isinstance(acc, dict):
                 w.write_json("raw/account.json", acc)
-                prefs = find_strings(acc, r"instruction|preference|about|profile|custom")
-                if prefs:
-                    w.write("preferences.md", "\n\n".join(f"## {k}\n\n{v}" for k, v in prefs))
+                print(f"帳號:{acc.get('email_address')} ({acc.get('display_name')})")
             else:
                 problems.append(f"account: HTTP {st}")
 
-            # 記憶
-            mem_done = False
+            # 自訂指令(Settings → Your Claude → Instructions)
+            st, prof = api.get("/api/account_profile")
+            if st == 200 and isinstance(prof, dict):
+                w.write_json("raw/account_profile.json", prof)
+                parts = [(k, prof.get(k)) for k in ("conversation_preferences", "cowork_global_instructions")]
+                body = "\n\n".join(f"## {k}\n\n{v}" for k, v in parts if isinstance(v, str) and v.strip())
+                w.write("preferences.md", body or "(沒有自訂指令)")
+            else:
+                problems.append(f"account_profile: HTTP {st}")
+
+            # 記憶:舊式 /memory 字串 + 新式 melange 條目;memory_mode 為 off 時兩者通常都是空
+            st, mset = api.get(f"/api/organizations/{oid}/memory/settings")
+            if st == 200:
+                w.write_json("raw/memory_settings.json", mset)
+                print(f"記憶模式:{mset.get('memory_mode')}")
+            sections = []
             for tpl in MEMORY_CANDIDATES:
                 st, mem = api.get(tpl.format(org=oid))
                 if st == 200:
                     w.write_json("raw/memory.json", mem)
-                    texts = find_strings(mem, r"^(memory|content|text|summary|synthesis)$")
-                    body = "\n\n".join(v for _, v in texts) if texts else \
-                        "```json\n" + json.dumps(mem, ensure_ascii=False, indent=2) + "\n```"
-                    w.write("memory.md", body)
-                    mem_done = True
+                    if isinstance(mem, dict) and str(mem.get("memory") or "").strip():
+                        sections.append("## memory\n\n" + mem["memory"].strip())
                     break
-            if not mem_done:
+            else:
                 problems.append("memory: 所有候選端點都失敗(執行 discover 找真實端點)")
+            st, mel = api.post_json(f"/api/organizations/{oid}/melange/list", {})
+            if st == 200 and isinstance(mel, dict):
+                w.write_json("raw/memory_melange.json", mel)
+                for it in as_list(mel, "data"):
+                    txt = "\n".join(v for _, v in find_strings(it, r"^(content|text|memory|summary|title)$"))
+                    sections.append("- " + (txt or json.dumps(it, ensure_ascii=False)).replace("\n", "\n  "))
+            w.write("memory.md", "\n\n".join(sections) or "(目前沒有記憶內容;若網頁上記憶是 off 屬正常)")
 
             # Styles
             for tpl in STYLE_CANDIDATES:
@@ -353,7 +388,9 @@ def main():
     ap = argparse.ArgumentParser(description="同步 claude.ai 記憶與 prompt 到本機")
     ap.add_argument("--out", default=str(DEFAULT_OUT), help="輸出資料夾")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("login").set_defaults(f=cmd_login)
+    lg = sub.add_parser("login")
+    lg.add_argument("--fresh", action="store_true", help="先清除現有登入(切換帳號用)")
+    lg.set_defaults(f=cmd_login)
     s = sub.add_parser("sync")
     s.add_argument("--headed", action="store_true", help="顯示瀏覽器(被 Cloudflare 擋時用)")
     s.add_argument("--org", help="指定組織 uuid")
